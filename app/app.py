@@ -1,77 +1,94 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException
+from app.db import Post, create_db_tables, get_async_session
+from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
+from sqlalchemy import select
+import uuid
 
-app= FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_db_tables()   # runs once when app starts
+    yield
+    # cleanup code here (if needed)
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def read_root():
     return {"server_status": "running"}
 
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),         # binary file from client
+    caption: str = Form(...),             # text field from HTML form
+    session: AsyncSession = Depends(get_async_session)  # DB session
+):
+    # Step 1: Create the object
+    post = Post(
+        caption=caption,
+        url="dummy_url",
+        file_type="photo",
+        file_name="dummy_name"
+    )
 
-text_posts = {
-    1: {"name": "prajwal", "title": "cool_pic", "content": "full chill mood at goa beach"},
-    2: {"name": "ananya", "title": "morning_vibes", "content": "sunrise and coffee make the best combo"},
-    3: {"name": "rohit", "title": "gym_day", "content": "leg day done and dusted"},
-    4: {"name": "megha", "title": "road_trip", "content": "long drive through the hills"},
-    5: {"name": "arjun", "title": "coding_night", "content": "debugging till 2 am but worth it"},
-    6: {"name": "sneha", "title": "foodie_life", "content": "trying out a new pasta recipe"},
-    7: {"name": "vikram", "title": "match_win", "content": "our team won the finals today"},
-    8: {"name": "kiran", "title": "rainy_day", "content": "love the smell of fresh rain"},
-    9: {"name": "pooja", "title": "book_time", "content": "reading a thriller novel tonight"},
-    10: {"name": "rahul", "title": "tech_event", "content": "attended an AI conference in bangalore"},
-    11: {"name": "nisha", "title": "family_time", "content": "weekend lunch with cousins"},
-    12: {"name": "manoj", "title": "startup_idea", "content": "brainstorming new app concepts"},
-    13: {"name": "divya", "title": "fitness_goal", "content": "completed 5km run today"},
-    14: {"name": "akash", "title": "movie_night", "content": "watched a sci-fi blockbuster"},
-    15: {"name": "lavanya", "title": "art_work", "content": "finished my latest painting"},
-    16: {"name": "suraj", "title": "music_jam", "content": "learning a new guitar chord"},
-    17: {"name": "harsha", "title": "camping_fun", "content": "spent the night under the stars"},
-    18: {"name": "priya", "title": "exam_prep", "content": "studying hard for upcoming tests"},
-    19: {"name": "deepak", "title": "market_day", "content": "fresh veggies from local market"},
-    20: {"name": "isha", "title": "pet_love", "content": "my dog learned a new trick today"}
-}
-#all without parameter
-@app.get("/posts")
-def get_all_posts():
-    return text_posts
+    # Step 2: Stage it (like git add)
+    session.add(post)
 
-#with parameter
-#this will give error if id is not present in text_posts
-@app.get("/posts/{id}")
-def get_post_id(id:int):
-    return text_posts[id]
+    # Step 3: Persist it (like git commit)
+    await session.commit()
 
-#this will not give error if id is not present in text_posts, it will return null
-@app.get("/posts-2/{id}")
-def get_post_id(id:int):
-    return text_posts.get(id)
+    # Step 4: Refresh to populate auto-generated fields
+    await session.refresh(post)
 
-#handling error if id is not present in text_posts
-from fastapi import HTTPException
+    return post
 
-@app.get("/posts-3/{id}")
-def get_post_id(id:int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="id not found") 
-    return text_posts.get(id)
+@app.get("/feed")
+async def get_feed(
+    sesseion:AsyncSession = Depends(get_async_session)
+):
+ 
+    result = await sesseion.execute(select(Post).order_by(Post.created_at.desc()).limit(10))
 
+ # Extract results from cursor
+    posts = [row[0] for row in result.all()]
 
-#Query Parameters
-@app.get("/posts-with-limit")
-def get_posts_with_limit(limit: int = None):
-    if limit is None:
-        return None
-    return dict(list(text_posts.items())[:limit])
+    # Serialize to JSON-safe dicts
+    post_data = []
+    for post in posts:
+        post_data.append({
+            "id": str(post.id),
+            "caption": post.caption,
+            "url": post.url,
+            "file_type": post.file_type,
+            "file_name": post.file_name,
+            "created_at": post.created_at.isoformat()
+        })
 
-#Request Body
-from app.schema import PostCreate,PostReturn
+    return post_data
 
-@app.post("/create_post") 
-def create_post(post: PostCreate) ->PostReturn :
-    new_id = max(text_posts.keys()) + 1
-    body={
-        'name': post.name,
-        'title': post.title,
-        'content': post.content
-    }
-    text_posts[new_id] = body
-    return text_posts[new_id]
+@app.delete("/posts/{post_id}")
+async def delete_post(
+    post_id: str,
+    session: AsyncSession = Depends(get_async_session)
+):
+    try:
+        # Convert string to UUID object for comparison
+        post_uuid = uuid.UUID(post_id)
+
+        # Query for the specific post
+        result = await session.execute(
+            select(Post).where(Post.id == post_uuid)
+        )
+        post = result.scalars().first()
+
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+
+        # Delete and commit
+        await session.delete(post)
+        await session.commit()
+
+        return {"success": True, "message": "Post deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
